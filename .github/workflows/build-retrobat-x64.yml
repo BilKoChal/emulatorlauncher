@@ -25,26 +25,93 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Setup .NET Framework 4.0 Developer Targeting Pack
+      - name: Install .NET Framework 4.0 Targeting Pack
         shell: pwsh
         run: |
-          # The Windows 2022 runner has .NET Framework 4.8 installed which is
-          # backward-compatible with 4.0. However, the project explicitly
-          # references the v4.0 targeting pack directory. We create a symlink
-          # so MSBuild can resolve the reference paths.
-          $targetingPackDir = "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.0"
-          if (-Not (Test-Path $targetingPackDir)) {
-              # If v4.0 targeting pack is not present, install it via chocolatey
-              choco install netfx-4.0-dev-pack --yes
+          # The Windows 2022 runner does NOT have .NET Framework 4.0 targeting pack.
+          # We download the Microsoft.NETFramework.ReferenceAssemblies.net40 NuGet package
+          # and extract the reference assemblies to the system targeting pack directory.
+          # This is the official Microsoft NuGet package that contains the exact same
+          # reference assemblies that the Developer Pack installer provides.
+
+          $targetDir = "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.0"
+
+          if (Test-Path $targetDir) {
+            Write-Host ".NET Framework 4.0 targeting pack already installed"
+            return
           }
 
-      - name: Restore NuGet packages (if any)
-        shell: pwsh
-        run: |
-          # This project uses DLLs from libs/ folder, not NuGet.
-          # No NuGet restore is needed, but we check just in case.
-          if (Test-Path "packages.config") {
-              nuget restore
+          $pkgUrl = "https://www.nuget.org/api/v2/package/Microsoft.NETFramework.ReferenceAssemblies.net40/1.0.3"
+          $zipPath = "$env:TEMP\net40-ref.zip"
+          $extractPath = "$env:TEMP\net40-ref"
+
+          Write-Host "Downloading Microsoft.NETFramework.ReferenceAssemblies.net40 1.0.3..."
+          Invoke-WebRequest -Uri $pkgUrl -OutFile $zipPath -MaximumRetryCount 3
+
+          Write-Host "Extracting package..."
+          if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+          Expand-Archive -Path $zipPath -Destination $extractPath -Force
+
+          # Show package structure for debugging
+          Write-Host "Package top-level contents:"
+          Get-ChildItem $extractPath | ForEach-Object { Write-Host "  $($_.Name)" }
+
+          # The NuGet package stores reference assemblies under: build\.NETFramework\v4.0\
+          $srcBase = Join-Path $extractPath "build\.NETFramework\v4.0"
+
+          if (-Not (Test-Path $srcBase)) {
+            Write-Host "ERROR: Expected directory not found in package: build\.NETFramework\v4.0"
+            Write-Host "Searching for DLLs in package..."
+            Get-ChildItem $extractPath -Recurse -Filter "mscorlib.dll" | ForEach-Object {
+              Write-Host "  Found mscorlib.dll at: $($_.DirectoryName.Replace($extractPath, ''))"
+            }
+            exit 1
+          }
+
+          # Create the system targeting pack directory
+          New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+
+          # Copy ALL contents (DLLs, RedistList, Profile, etc.)
+          Copy-Item -Path "$srcBase\*" -Destination $targetDir -Recurse -Force
+
+          Write-Host ""
+          Write-Host "Installed .NET Framework 4.0 reference assemblies to: $targetDir"
+
+          # Verify critical files
+          $criticalFiles = @(
+            "$targetDir\mscorlib.dll",
+            "$targetDir\System.dll",
+            "$targetDir\System.Core.dll",
+            "$targetDir\RedistList\FrameworkList.xml"
+          )
+          $allOk = $true
+          foreach ($f in $criticalFiles) {
+            if (Test-Path $f) {
+              Write-Host "  OK: $f"
+            } else {
+              Write-Host "  MISSING: $f"
+              $allOk = $false
+            }
+          }
+
+          # Also verify Client Profile
+          $clientDir = "$targetDir\Profile\Client"
+          if (Test-Path $clientDir) {
+            Write-Host "  OK: Client Profile directory exists"
+            if (Test-Path "$clientDir\RedistList\FrameworkList.xml") {
+              Write-Host "  OK: Client Profile FrameworkList.xml exists"
+            } else {
+              Write-Host "  WARNING: Client Profile FrameworkList.xml missing"
+            }
+          } else {
+            Write-Host "  WARNING: Client Profile directory missing"
+          }
+
+          if (-Not $allOk) {
+            Write-Host ""
+            Write-Host "Full targeting pack directory contents:"
+            Get-ChildItem $targetDir -Recurse | Select-Object FullName | Format-Table -AutoSize
+            exit 1
           }
 
       - name: Build solution (Release x64)
@@ -63,12 +130,19 @@ jobs:
             "es-update\bin\Release\es-update.exe",
             "mount\bin\Release\mount.exe"
           )
+          $missing = 0
           foreach ($file in $outputs) {
             if (Test-Path $file) {
-              Write-Host "OK: $file"
+              $size = (Get-Item $file).Length
+              Write-Host "OK: $file ($size bytes)"
             } else {
               Write-Host "MISSING: $file"
+              $missing++
             }
+          }
+          if ($missing -gt 0) {
+            Write-Host ""
+            Write-Host "WARNING: $missing file(s) missing from build output"
           }
 
       - name: Package build artifacts
