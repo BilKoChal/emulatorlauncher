@@ -1,247 +1,150 @@
-name: Build RetroBat EmulatorLauncher (x64)
-
+name: Build emulatorlauncher (Windows x64)
+ 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ master ]
   pull_request:
-    branches: [ main, master ]
-  workflow_dispatch:  # Allow manual trigger from GitHub UI
-
+    branches: [ master ]
+  workflow_dispatch:
+ 
 jobs:
   build:
-    runs-on: windows-2022  # Windows Server 2022 with VS 2022
-
-    env:
-      SOLUTION: batocera-ports.sln
-      CONFIGURATION: Release
-      PLATFORM: x64
-
+    runs-on: windows-latest
+ 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
+ 
+      # .NET Framework 4.0 is already available on windows-latest runners,
+      # but we install the build tools to ensure MSBuild / NuGet are on PATH.
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
-
-      - name: Install .NET Framework 4.0 Targeting Pack
+ 
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+ 
+      - name: Restore NuGet packages
+        run: nuget restore batocera-ports.sln
+ 
+      - name: Patch AssemblyInfo version
         shell: pwsh
         run: |
-          # The Windows 2022 runner does NOT have .NET Framework 4.0 targeting pack.
-          # We download the Microsoft.NETFramework.ReferenceAssemblies.net40 NuGet package
-          # and extract the reference assemblies to the system targeting pack directory.
-          # This is the official Microsoft NuGet package that contains the exact same
-          # reference assemblies that the Developer Pack installer provides.
-
-          $targetDir = "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.0"
-
-          if (Test-Path $targetDir) {
-            Write-Host ".NET Framework 4.0 targeting pack already installed"
-            return
+          $version = "1.0.0.${{ github.run_number }}"
+          Get-ChildItem -Recurse -Filter "AssemblyInfo.*" | ForEach-Object {
+            $content = Get-Content $_.FullName -Raw
+            $content = $content -replace 'AssemblyVersion\("[^"]*"\)',      "AssemblyVersion(`"$version`")"
+            $content = $content -replace 'AssemblyFileVersion\("[^"]*"\)',  "AssemblyFileVersion(`"$version`")"
+            $content = $content -replace 'AssemblyInformationalVersion\("[^"]*"\)', "AssemblyInformationalVersion(`"$version`")"
+            Set-Content $_.FullName $content
           }
-
-          $pkgUrl = "https://www.nuget.org/api/v2/package/Microsoft.NETFramework.ReferenceAssemblies.net40/1.0.3"
-          $zipPath = "$env:TEMP\net40-ref.zip"
-          $extractPath = "$env:TEMP\net40-ref"
-
-          Write-Host "Downloading Microsoft.NETFramework.ReferenceAssemblies.net40 1.0.3..."
-          Invoke-WebRequest -Uri $pkgUrl -OutFile $zipPath -MaximumRetryCount 3
-
-          Write-Host "Extracting package..."
-          if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
-          Expand-Archive -Path $zipPath -Destination $extractPath -Force
-
-          # Show package structure for debugging
-          Write-Host "Package top-level contents:"
-          Get-ChildItem $extractPath | ForEach-Object { Write-Host "  $($_.Name)" }
-
-          # The NuGet package stores reference assemblies under: build\.NETFramework\v4.0\
-          $srcBase = Join-Path $extractPath "build\.NETFramework\v4.0"
-
-          if (-Not (Test-Path $srcBase)) {
-            Write-Host "ERROR: Expected directory not found in package: build\.NETFramework\v4.0"
-            Write-Host "Searching for DLLs in package..."
-            Get-ChildItem $extractPath -Recurse -Filter "mscorlib.dll" | ForEach-Object {
-              Write-Host "  Found mscorlib.dll at: $($_.DirectoryName.Replace($extractPath, ''))"
-            }
-            exit 1
-          }
-
-          # Create the system targeting pack directory
-          New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
-
-          # Copy ALL contents (DLLs, RedistList, Profile, etc.)
-          Copy-Item -Path "$srcBase\*" -Destination $targetDir -Recurse -Force
-
-          Write-Host ""
-          Write-Host "Installed .NET Framework 4.0 reference assemblies to: $targetDir"
-
-          # Verify critical files
-          $criticalFiles = @(
-            "$targetDir\mscorlib.dll",
-            "$targetDir\System.dll",
-            "$targetDir\System.Core.dll",
-            "$targetDir\RedistList\FrameworkList.xml"
-          )
-          $allOk = $true
-          foreach ($f in $criticalFiles) {
-            if (Test-Path $f) {
-              Write-Host "  OK: $f"
-            } else {
-              Write-Host "  MISSING: $f"
-              $allOk = $false
-            }
-          }
-
-          # Also verify Client Profile
-          $clientDir = "$targetDir\Profile\Client"
-          if (Test-Path $clientDir) {
-            Write-Host "  OK: Client Profile directory exists"
-            if (Test-Path "$clientDir\RedistList\FrameworkList.xml") {
-              Write-Host "  OK: Client Profile FrameworkList.xml exists"
-            } else {
-              Write-Host "  WARNING: Client Profile FrameworkList.xml missing"
-            }
-          } else {
-            Write-Host "  WARNING: Client Profile directory missing"
-          }
-
-          if (-Not $allOk) {
-            Write-Host ""
-            Write-Host "Full targeting pack directory contents:"
-            Get-ChildItem $targetDir -Recurse | Select-Object FullName | Format-Table -AutoSize
-            exit 1
-          }
-
-      - name: Build solution (Release x64)
-        run: msbuild $env:SOLUTION /p:Configuration=$env:CONFIGURATION /p:Platform=$env:PLATFORM /verbosity:minimal /m
-
-      - name: Verify build outputs
+          Write-Host "Version set to $version"
+ 
+      - name: Build solution (Release / Any CPU)
+        run: >
+          msbuild batocera-ports.sln
+          /p:Configuration=Release
+          /p:Platform="Any CPU"
+          /p:PlatformTarget=x64
+          /m
+          /v:minimal
+ 
+      - name: Collect build artifacts
         shell: pwsh
         run: |
-          $outputs = @(
+          # Copy compiled binaries to staging directory
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+ 
+          $bins = @(
             "emulatorLauncher\bin\Release\emulatorLauncher.exe",
             "EmulatorLauncher.Common\bin\Release\EmulatorLauncher.Common.dll",
             "batocera-retroachievements-info\bin\Release\batocera-retroachievements-info.exe",
             "batocera-systems\bin\Release\batocera-systems.exe",
             "batocera-store\bin\Release\batocera-store.exe",
-            "es-checkversion\bin\Release\es-checkversion.exe",
-            "es-update\bin\Release\es-update.exe",
             "mount\bin\Release\mount.exe"
           )
-          $missing = 0
-          foreach ($file in $outputs) {
-            if (Test-Path $file) {
-              $size = (Get-Item $file).Length
-              Write-Host "OK: $file ($size bytes)"
+ 
+          # Rename test binaries as the original CI does
+          $renames = @{
+            "es-checkversion\bin\Release\es-checkversion.exe" = "staging\es-checkversion-test.exe"
+            "es-update\bin\Release\es-update.exe"             = "staging\es-update-test.exe"
+          }
+ 
+          foreach ($bin in $bins) {
+            if (Test-Path $bin) {
+              Copy-Item $bin staging\ -Force
+              Write-Host "Copied $bin"
             } else {
-              Write-Host "MISSING: $file"
-              $missing++
+              Write-Warning "Not found: $bin"
             }
           }
-          if ($missing -gt 0) {
-            Write-Host ""
-            Write-Host "WARNING: $missing file(s) missing from build output"
-          }
-
-      - name: Package build artifacts
-        shell: pwsh
-        run: |
-          $stagingDir = "staging"
-          New-Item -ItemType Directory -Force -Path $stagingDir
-
-          # Copy main executables from x64 Release builds
-          $binFiles = @(
-            @{ Src="emulatorLauncher\bin\Release\emulatorLauncher.exe"; Dst="emulatorLauncher.exe" },
-            @{ Src="EmulatorLauncher.Common\bin\Release\EmulatorLauncher.Common.dll"; Dst="EmulatorLauncher.Common.dll" },
-            @{ Src="batocera-retroachievements-info\bin\Release\batocera-retroachievements-info.exe"; Dst="batocera-retroachievements-info.exe" },
-            @{ Src="batocera-systems\bin\Release\batocera-systems.exe"; Dst="batocera-systems.exe" },
-            @{ Src="batocera-store\bin\Release\batocera-store.exe"; Dst="batocera-store.exe" },
-            @{ Src="es-checkversion\bin\Release\es-checkversion.exe"; Dst="es-checkversion.exe" },
-            @{ Src="es-update\bin\Release\es-update.exe"; Dst="es-update.exe" },
-            @{ Src="mount\bin\Release\mount.exe"; Dst="mount.exe" }
-          )
-
-          foreach ($f in $binFiles) {
-            if (Test-Path $f.Src) {
-              Copy-Item $f.Src -Destination "$stagingDir\$($f.Dst)" -Force
-              Write-Host "Copied: $($f.Src) -> $($f.Dst)"
+ 
+          foreach ($src in $renames.Keys) {
+            if (Test-Path $src) {
+              Copy-Item $src $renames[$src] -Force
+              Write-Host "Copied $src -> $($renames[$src])"
             } else {
-              Write-Host "WARNING: Not found: $($f.Src)"
+              Write-Warning "Not found: $src"
             }
           }
-
-          # Copy native/binary dependencies from libs/
-          $nativeFiles = @(
-            "libs\7za.exe",
-            "libs\7za.dll",
-            "libs\7zxa.dll",
-            "libs\7z.exe",
-            "libs\7z.dll",
-            "libs\7z-x64.dll",
+ 
+          # Copy bundled libs from the repo's libs/ directory
+          $libs = @(
+            "libs\7z.exe", "libs\7z.dll",
+            "libs\7za.exe", "libs\7za.dll", "libs\7zxa.dll",
             "libs\Newtonsoft.Json.dll",
             "libs\System.Data.SQLite.dll",
-            "libs\SharpDX.dll",
-            "libs\SharpDX.DirectInput.dll",
-            "libs\SharpDX.XInput.dll",
-            "libs\liblzma.dll",
-            "libs\liblzma-5.dll",
-            "libs\liblzo2-2.dll",
-            "libs\libsquashfs.dll",
-            "libs\libzstd.dll",
-            "libs\pdfinfo.exe",
-            "libs\pdftoppm.exe",
-            "libs\rdsquashfs.exe",
-            "libs\xbox-iso-vfs.exe",
-            "unzip.exe",
-            "unzip32.dll"
+            "libs\unzip.exe", "libs\unzip32.dll",
+            "libs\pdftoppm.exe", "libs\pdfinfo.exe",
+            "libs\rdsquashfs.exe", "libs\xbox-iso-vfs.exe",
+            "libs\liblzma.dll", "libs\liblzo2-2.dll",
+            "libs\libsquashfs.dll", "libs\libzstd.dll"
           )
-
-          foreach ($f in $nativeFiles) {
-            if (Test-Path $f) {
-              Copy-Item $f -Destination $stagingDir -Force
-              Write-Host "Copied: $f"
+ 
+          foreach ($lib in $libs) {
+            if (Test-Path $lib) {
+              Copy-Item $lib staging\ -Force
+              Write-Host "Copied $lib"
             } else {
-              Write-Host "WARNING: Not found: $f"
+              Write-Warning "Not found: $lib"
             }
           }
-
-          # Copy emulationstation config
+ 
+          # Copy EmulationStation config
           if (Test-Path ".emulationstation\es_features.cfg") {
-            $esDir = "$stagingDir\.emulationstation"
-            New-Item -ItemType Directory -Force -Path $esDir
-            Copy-Item ".emulationstation\es_features.cfg" -Destination $esDir -Force
-            if (Test-Path ".emulationstation\es_savestates.cfg") {
-              Copy-Item ".emulationstation\es_savestates.cfg" -Destination $esDir -Force
-            }
+            New-Item -ItemType Directory -Force -Path "staging\.emulationstation" | Out-Null
+            Copy-Item ".emulationstation\es_features.cfg" "staging\.emulationstation\" -Force
+            Write-Host "Copied es_features.cfg"
           }
-
-          # Create ZIP archive
-          Compress-Archive -Path "$stagingDir\*" -DestinationPath "retrobat-emulatorlauncher-x64.zip" -Force
-          Write-Host "Created: retrobat-emulatorlauncher-x64.zip"
-
+ 
+      - name: Create release ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path staging\* -DestinationPath batocera-ports-x64.zip -Force
+          Write-Host "Archive created: batocera-ports-x64.zip"
+ 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: retrobat-emulatorlauncher-x64
-          path: retrobat-emulatorlauncher-x64.zip
-          retention-days: 90
-
-      - name: Create GitHub Release (on main/master push only)
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+          name: batocera-ports-x64-${{ github.run_number }}
+          path: batocera-ports-x64.zip
+          retention-days: 30
+ 
+      # -----------------------------------------------------------------------
+      # Optional: publish as a GitHub Release on every push to master.
+      # Remove or comment out this step if you don't want automatic releases.
+      # -----------------------------------------------------------------------
+      - name: Create / update GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: continuous-x64
-          name: Continuous Build (x64)
+          tag_name: continuous
+          name: continuous
+          files: batocera-ports-x64.zip
+          prerelease: true
           body: |
-            Automated build of RetroBat EmulatorLauncher for Windows x64.
-
-            **Commit:** ${{ github.sha }}
-            **Branch:** ${{ github.ref_name }}
-            **Build Date:** ${{ github.event.head_commit.timestamp }}
-
-            Built with Configuration=Release, Platform=x64
-          files: retrobat-emulatorlauncher-x64.zip
+            Automated build from commit ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+            Run: ${{ github.run_number }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+ 
