@@ -1,0 +1,173 @@
+name: Build RetroBat EmulatorLauncher (x64)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # Allow manual trigger from GitHub UI
+
+jobs:
+  build:
+    runs-on: windows-2022  # Windows Server 2022 with VS 2022
+
+    env:
+      SOLUTION: batocera-ports.sln
+      CONFIGURATION: Release
+      PLATFORM: x64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup .NET Framework 4.0 Developer Targeting Pack
+        shell: pwsh
+        run: |
+          # The Windows 2022 runner has .NET Framework 4.8 installed which is
+          # backward-compatible with 4.0. However, the project explicitly
+          # references the v4.0 targeting pack directory. We create a symlink
+          # so MSBuild can resolve the reference paths.
+          $targetingPackDir = "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.0"
+          if (-Not (Test-Path $targetingPackDir)) {
+              # If v4.0 targeting pack is not present, install it via chocolatey
+              choco install netfx-4.0-dev-pack --yes
+          }
+
+      - name: Restore NuGet packages (if any)
+        shell: pwsh
+        run: |
+          # This project uses DLLs from libs/ folder, not NuGet.
+          # No NuGet restore is needed, but we check just in case.
+          if (Test-Path "packages.config") {
+              nuget restore
+          }
+
+      - name: Build solution (Release x64)
+        run: msbuild $env:SOLUTION /p:Configuration=$env:CONFIGURATION /p:Platform=$env:PLATFORM /verbosity:minimal /m
+
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          $outputs = @(
+            "emulatorLauncher\bin\Release\emulatorLauncher.exe",
+            "EmulatorLauncher.Common\bin\Release\EmulatorLauncher.Common.dll",
+            "batocera-retroachievements-info\bin\Release\batocera-retroachievements-info.exe",
+            "batocera-systems\bin\Release\batocera-systems.exe",
+            "batocera-store\bin\Release\batocera-store.exe",
+            "es-checkversion\bin\Release\es-checkversion.exe",
+            "es-update\bin\Release\es-update.exe",
+            "mount\bin\Release\mount.exe"
+          )
+          foreach ($file in $outputs) {
+            if (Test-Path $file) {
+              Write-Host "OK: $file"
+            } else {
+              Write-Host "MISSING: $file"
+            }
+          }
+
+      - name: Package build artifacts
+        shell: pwsh
+        run: |
+          $stagingDir = "staging"
+          New-Item -ItemType Directory -Force -Path $stagingDir
+
+          # Copy main executables from x64 Release builds
+          $binFiles = @(
+            @{ Src="emulatorLauncher\bin\Release\emulatorLauncher.exe"; Dst="emulatorLauncher.exe" },
+            @{ Src="EmulatorLauncher.Common\bin\Release\EmulatorLauncher.Common.dll"; Dst="EmulatorLauncher.Common.dll" },
+            @{ Src="batocera-retroachievements-info\bin\Release\batocera-retroachievements-info.exe"; Dst="batocera-retroachievements-info.exe" },
+            @{ Src="batocera-systems\bin\Release\batocera-systems.exe"; Dst="batocera-systems.exe" },
+            @{ Src="batocera-store\bin\Release\batocera-store.exe"; Dst="batocera-store.exe" },
+            @{ Src="es-checkversion\bin\Release\es-checkversion.exe"; Dst="es-checkversion.exe" },
+            @{ Src="es-update\bin\Release\es-update.exe"; Dst="es-update.exe" },
+            @{ Src="mount\bin\Release\mount.exe"; Dst="mount.exe" }
+          )
+
+          foreach ($f in $binFiles) {
+            if (Test-Path $f.Src) {
+              Copy-Item $f.Src -Destination "$stagingDir\$($f.Dst)" -Force
+              Write-Host "Copied: $($f.Src) -> $($f.Dst)"
+            } else {
+              Write-Host "WARNING: Not found: $($f.Src)"
+            }
+          }
+
+          # Copy native/binary dependencies from libs/
+          $nativeFiles = @(
+            "libs\7za.exe",
+            "libs\7za.dll",
+            "libs\7zxa.dll",
+            "libs\7z.exe",
+            "libs\7z.dll",
+            "libs\7z-x64.dll",
+            "libs\Newtonsoft.Json.dll",
+            "libs\System.Data.SQLite.dll",
+            "libs\SharpDX.dll",
+            "libs\SharpDX.DirectInput.dll",
+            "libs\SharpDX.XInput.dll",
+            "libs\liblzma.dll",
+            "libs\liblzma-5.dll",
+            "libs\liblzo2-2.dll",
+            "libs\libsquashfs.dll",
+            "libs\libzstd.dll",
+            "libs\pdfinfo.exe",
+            "libs\pdftoppm.exe",
+            "libs\rdsquashfs.exe",
+            "libs\xbox-iso-vfs.exe",
+            "unzip.exe",
+            "unzip32.dll"
+          )
+
+          foreach ($f in $nativeFiles) {
+            if (Test-Path $f) {
+              Copy-Item $f -Destination $stagingDir -Force
+              Write-Host "Copied: $f"
+            } else {
+              Write-Host "WARNING: Not found: $f"
+            }
+          }
+
+          # Copy emulationstation config
+          if (Test-Path ".emulationstation\es_features.cfg") {
+            $esDir = "$stagingDir\.emulationstation"
+            New-Item -ItemType Directory -Force -Path $esDir
+            Copy-Item ".emulationstation\es_features.cfg" -Destination $esDir -Force
+            if (Test-Path ".emulationstation\es_savestates.cfg") {
+              Copy-Item ".emulationstation\es_savestates.cfg" -Destination $esDir -Force
+            }
+          }
+
+          # Create ZIP archive
+          Compress-Archive -Path "$stagingDir\*" -DestinationPath "retrobat-emulatorlauncher-x64.zip" -Force
+          Write-Host "Created: retrobat-emulatorlauncher-x64.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrobat-emulatorlauncher-x64
+          path: retrobat-emulatorlauncher-x64.zip
+          retention-days: 90
+
+      - name: Create GitHub Release (on main/master push only)
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: continuous-x64
+          name: Continuous Build (x64)
+          body: |
+            Automated build of RetroBat EmulatorLauncher for Windows x64.
+
+            **Commit:** ${{ github.sha }}
+            **Branch:** ${{ github.ref_name }}
+            **Build Date:** ${{ github.event.head_commit.timestamp }}
+
+            Built with Configuration=Release, Platform=x64
+          files: retrobat-emulatorlauncher-x64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
