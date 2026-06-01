@@ -1,45 +1,69 @@
 name: Build emulatorlauncher (Windows x64)
- 
+
 on:
   push:
     branches: [ master ]
   pull_request:
     branches: [ master ]
   workflow_dispatch:
- 
+
 jobs:
   build:
     runs-on: windows-latest
- 
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
- 
-      # .NET Framework 4.0 is already available on windows-latest runners,
-      # but we install the build tools to ensure MSBuild / NuGet are on PATH.
+
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
- 
+
       - name: Setup NuGet
         uses: NuGet/setup-nuget@v2
- 
+
+      # windows-latest (VS 2022) ships targeting packs from 4.5+.
+      # Every project in this solution targets v4.0, so we must install
+      # the .NET Framework 4.0 Developer Pack before MSBuild can resolve
+      # the reference assemblies (fixes MSB3644).
+      - name: Install .NET Framework 4.0 Targeting Pack
+        shell: pwsh
+        run: |
+          $url = "https://download.microsoft.com/download/1/B/E/1BE39E79-7E39-46A3-96FF-047F95396215/dotNetFx40_Full_setup.exe"
+          $tp  = "https://download.microsoft.com/download/0/A/D/0ADC4F99-0A5B-4B18-B435-88B2C9F09419/NDP40-KB2468871-v2-x86-x64-ia64.exe"
+
+          # The targeting-pack installer is the .NET Framework 4.0 Multi-Targeting Pack.
+          # Easiest path: install via Chocolatey which wraps the official MS installer.
+          choco install netfx-4.0.3-devpack --yes --no-progress 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Chocolatey install returned $LASTEXITCODE — checking if reference assemblies landed anyway."
+          }
+
+          # Verify the reference assemblies are present
+          $refPath = "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.0"
+          if (Test-Path $refPath) {
+            Write-Host "Reference assemblies found at: $refPath"
+          } else {
+            Write-Error "Reference assemblies NOT found at $refPath — build will fail."
+            exit 1
+          }
+
       - name: Restore NuGet packages
         run: nuget restore batocera-ports.sln
- 
+
       - name: Patch AssemblyInfo version
         shell: pwsh
         run: |
           $version = "1.0.0.${{ github.run_number }}"
           Get-ChildItem -Recurse -Filter "AssemblyInfo.*" | ForEach-Object {
             $content = Get-Content $_.FullName -Raw
-            $content = $content -replace 'AssemblyVersion\("[^"]*"\)',      "AssemblyVersion(`"$version`")"
-            $content = $content -replace 'AssemblyFileVersion\("[^"]*"\)',  "AssemblyFileVersion(`"$version`")"
-            $content = $content -replace 'AssemblyInformationalVersion\("[^"]*"\)', "AssemblyInformationalVersion(`"$version`")"
+            $content = $content -replace 'AssemblyVersion\("[^"]*"\)',                  "AssemblyVersion(`"$version`")"
+            $content = $content -replace 'AssemblyFileVersion\("[^"]*"\)',              "AssemblyFileVersion(`"$version`")"
+            $content = $content -replace 'AssemblyInformationalVersion\("[^"]*"\)',     "AssemblyInformationalVersion(`"$version`")"
             Set-Content $_.FullName $content
           }
           Write-Host "Version set to $version"
- 
-      - name: Build solution (Release / Any CPU)
+
+      - name: Build solution (Release / x64)
         run: >
           msbuild batocera-ports.sln
           /p:Configuration=Release
@@ -47,13 +71,13 @@ jobs:
           /p:PlatformTarget=x64
           /m
           /v:minimal
- 
-      - name: Collect build artifacts
+
+      - name: Collect artifacts into staging directory
         shell: pwsh
         run: |
-          # Copy compiled binaries to staging directory
           New-Item -ItemType Directory -Force -Path staging | Out-Null
- 
+
+          # Compiled binaries
           $bins = @(
             "emulatorLauncher\bin\Release\emulatorLauncher.exe",
             "EmulatorLauncher.Common\bin\Release\EmulatorLauncher.Common.dll",
@@ -62,34 +86,24 @@ jobs:
             "batocera-store\bin\Release\batocera-store.exe",
             "mount\bin\Release\mount.exe"
           )
- 
-          # Rename test binaries as the original CI does
+          foreach ($bin in $bins) {
+            if (Test-Path $bin) { Copy-Item $bin staging\ -Force; Write-Host "OK $bin" }
+            else                { Write-Warning "Missing: $bin" }
+          }
+
+          # Binaries that get renamed (matching original AppVeyor behaviour)
           $renames = @{
             "es-checkversion\bin\Release\es-checkversion.exe" = "staging\es-checkversion-test.exe"
             "es-update\bin\Release\es-update.exe"             = "staging\es-update-test.exe"
           }
- 
-          foreach ($bin in $bins) {
-            if (Test-Path $bin) {
-              Copy-Item $bin staging\ -Force
-              Write-Host "Copied $bin"
-            } else {
-              Write-Warning "Not found: $bin"
-            }
-          }
- 
           foreach ($src in $renames.Keys) {
-            if (Test-Path $src) {
-              Copy-Item $src $renames[$src] -Force
-              Write-Host "Copied $src -> $($renames[$src])"
-            } else {
-              Write-Warning "Not found: $src"
-            }
+            if (Test-Path $src) { Copy-Item $src $renames[$src] -Force; Write-Host "OK $src -> $($renames[$src])" }
+            else                { Write-Warning "Missing: $src" }
           }
- 
-          # Copy bundled libs from the repo's libs/ directory
+
+          # Bundled libs shipped inside the repo
           $libs = @(
-            "libs\7z.exe", "libs\7z.dll",
+            "libs\7z.exe",  "libs\7z.dll",
             "libs\7za.exe", "libs\7za.dll", "libs\7zxa.dll",
             "libs\Newtonsoft.Json.dll",
             "libs\System.Data.SQLite.dll",
@@ -99,41 +113,36 @@ jobs:
             "libs\liblzma.dll", "libs\liblzo2-2.dll",
             "libs\libsquashfs.dll", "libs\libzstd.dll"
           )
- 
           foreach ($lib in $libs) {
-            if (Test-Path $lib) {
-              Copy-Item $lib staging\ -Force
-              Write-Host "Copied $lib"
-            } else {
-              Write-Warning "Not found: $lib"
-            }
+            if (Test-Path $lib) { Copy-Item $lib staging\ -Force; Write-Host "OK $lib" }
+            else                { Write-Warning "Missing: $lib" }
           }
- 
-          # Copy EmulationStation config
+
+          # EmulationStation config
           if (Test-Path ".emulationstation\es_features.cfg") {
             New-Item -ItemType Directory -Force -Path "staging\.emulationstation" | Out-Null
             Copy-Item ".emulationstation\es_features.cfg" "staging\.emulationstation\" -Force
-            Write-Host "Copied es_features.cfg"
+            Write-Host "OK es_features.cfg"
           }
- 
+
       - name: Create release ZIP
         shell: pwsh
         run: |
           Compress-Archive -Path staging\* -DestinationPath batocera-ports-x64.zip -Force
-          Write-Host "Archive created: batocera-ports-x64.zip"
- 
-      - name: Upload build artifact
+          Write-Host "Created batocera-ports-x64.zip ($('{0:N0}' -f (Get-Item batocera-ports-x64.zip).Length) bytes)"
+
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: batocera-ports-x64-${{ github.run_number }}
           path: batocera-ports-x64.zip
           retention-days: 30
- 
+
       # -----------------------------------------------------------------------
-      # Optional: publish as a GitHub Release on every push to master.
-      # Remove or comment out this step if you don't want automatic releases.
+      # Publish as a "continuous" pre-release on every master push.
+      # Remove this step if you don't want automatic GitHub Releases.
       # -----------------------------------------------------------------------
-      - name: Create / update GitHub Release
+      - name: Publish GitHub Release (continuous)
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: softprops/action-gh-release@v2
         with:
@@ -142,9 +151,7 @@ jobs:
           files: batocera-ports-x64.zip
           prerelease: true
           body: |
-            Automated build from commit ${{ github.sha }}
-            Branch: ${{ github.ref_name }}
-            Run: ${{ github.run_number }}
+            Automated build — commit ${{ github.sha }}
+            Branch: ${{ github.ref_name }} | Run: ${{ github.run_number }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
- 
